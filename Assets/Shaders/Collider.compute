@@ -1,0 +1,204 @@
+﻿#pragma kernel Update
+
+#define PI 3.14159265358979
+
+struct ParticleData {
+	float2 initPos;
+	float2 pos;
+	float2 vel;
+	float4 col;
+};
+
+struct RectangleCollider {
+	bool active;
+	float2 position;
+	float rotation;
+	float2 points[4];
+};
+
+struct CircleCollider {
+	bool active;
+	float2 position;
+	float radius;
+};
+
+RWStructuredBuffer<ParticleData> _ParticlesBuffer;
+StructuredBuffer<RectangleCollider> _RectanglesBuffer;
+StructuredBuffer<CircleCollider> _CirclesBuffer;
+
+
+cbuffer cb {
+	int _NumRectangleCollider;
+	int _NumCircleCollider;
+	float2 _RangeMin;
+	float2 _RangeMax;
+	float _DeltaTime;
+	float2 _Gravity;
+};
+
+
+inline float2 Rotate(float2 p, float theta) {
+	float x = cos(theta) * p.x - sin(theta) * p.y;
+	float y = sin(theta) * p.x + cos(theta) * p.y;
+	return float2(x, y);
+}
+
+[numthreads(32,1,1)]
+void Update(uint3 id : SV_DispatchThreadID) {
+	float2 pos = _ParticlesBuffer[id.x].pos;
+	float2 vel = _ParticlesBuffer[id.x].vel;
+
+	float dt = _DeltaTime;
+
+	// Temporarily update position
+	float2 force = _Gravity;
+	float2 newVel = vel + force * dt;
+	float2 newPos = pos + vel * dt;
+
+
+	bool collided = false;
+
+	// --------------------------------------------------------------------------
+	// Rectangle Collision
+	// --------------------------------------------------------------------------
+	for (int i = 0; i < _NumRectangleCollider; i++) {
+		RectangleCollider rect = _RectanglesBuffer[i];
+
+		if (rect.active) {
+			float2 p[] = rect.points;			// Local rectangle point : left top, left bottom, right bottom, right top
+			float2 center = rect.position;		// Center of current rectangle
+			float rotation = rect.rotation;		// Rotation of current rectangle
+
+			// Is inside of rectangle ?
+			float2 translatedPosition = Rotate(newPos - center, -rotation);	// Particle position relative to the current rectangle position and rotation
+
+			if (p[0].x < translatedPosition.x && translatedPosition.x < p[3].x && p[2].y < translatedPosition.y && translatedPosition.y < p[3].y) {
+
+				collided = true;
+
+				// Respown particle which is in the current rectangle although collision was handled.
+				_ParticlesBuffer[id.x].vel = float2(0, 0);
+				_ParticlesBuffer[id.x].col = float4(1, 0, 0, 1);
+				_ParticlesBuffer[id.x].pos = float2(_ParticlesBuffer[id.x].initPos.x, _RangeMax.y);
+
+				_ParticlesBuffer[id.x].col = float4(0, 0, 1, 1);
+
+				// Line intersection detection (left -> bottom -> right -> top edges)
+				for (int i = 0; i < 4; i++) {
+					float2 a = p[i];
+					float2 b = p[(i + 1) % 4];
+					float2 c = Rotate(pos - center, -rotation);	// previous particle position relative to the current rectangle position and rotation
+					float2 d = translatedPosition;				// updated particle position relative to the current rectangle position and rotation
+
+					float tc = (a.x - b.x)*(c.y - a.y) + (a.y - b.y)*(a.x - c.x);
+					float td = (a.x - b.x)*(d.y - a.y) + (a.y - b.y)*(a.x - d.x);
+					float ta = (c.x - d.x)*(a.y - c.y) + (c.y - d.y)*(c.x - a.x);
+					float tb = (c.x - d.x)*(b.y - c.y) + (c.y - d.y)*(c.x - b.x);
+
+					// If intersected
+					if (tc*td < 0 && ta*tb < 0) {
+						float2 normal;
+						float depth;
+
+						// Which edge ?
+						switch (i) {
+							case 0 : 
+								normal = float2(-1, 0);
+								depth = p[0].x - translatedPosition.x;
+								break;
+							case 1 :
+								normal = float2(0, -1);
+								depth = p[1].y - translatedPosition.y;
+								break;
+							case 2:
+								normal = float2(1, 0);
+								depth = p[2].x - translatedPosition.x;
+								break;
+							case 3:
+								normal = float2(0, 1);
+								depth = p[0].y - translatedPosition.y;
+								break;
+						}
+
+
+						float2 newp = Rotate(translatedPosition + (depth + 5e-4f)*normal, rotation) + center;	// Calculate push backed particle position
+
+						// Calculate reflected velocity vector via the current rectangle normal
+						float2 f = d - c;
+						float a = dot(-f, normal);
+						float2 reflect = f + 2 * a * normal;
+
+						float2 newv = length(vel) * 0.9 * Rotate(normalize(reflect), rotation);		// Rotate back to world coordinate
+
+						_ParticlesBuffer[id.x].pos = newp + newv * dt;	// Calculate new particle position !!!
+						_ParticlesBuffer[id.x].vel = newv;
+						_ParticlesBuffer[id.x].col = float4(0, 0, 1, 1);
+
+						break;
+					}
+				}
+
+			}
+		}
+		
+
+	}
+
+
+	// --------------------------------------------------------------------------
+	// Rectangle Collision
+	// --------------------------------------------------------------------------
+	for (int i = 0; i < _NumCircleCollider; i++) {
+		CircleCollider circle = _CirclesBuffer[i];
+
+		if (circle.active) {
+
+			// Is insde circle ?
+			if (length(circle.position - newPos) < circle.radius) {
+				collided = true;
+
+				float2 c2p = newPos - circle.position;
+				float2 normal = normalize(c2p);
+				float distance = length(c2p);
+				float depth = circle.radius - distance;
+
+				float2 newp = newPos + (depth + 5e-4f) * normal;	// Calculate push backed particle position
+
+				// Calculate reflected velocity vector via the current circle normal;
+				float2 f = newPos - pos;
+				float a = dot(-f, normal);
+				float2 reflect = f + 2 * a * normal;
+
+				float2 newv = length(vel) * 0.9 * normalize(reflect);	// Calculate velocity reflection vector via circle normal
+
+				_ParticlesBuffer[id.x].pos = newp + newv * dt;
+				_ParticlesBuffer[id.x].vel = newv;
+				_ParticlesBuffer[id.x].col = float4(1, 0, 0, 1);
+
+				break;
+
+			}
+
+		}
+
+	}
+
+
+	// --------------------------------------------------------------------------
+	// Particle buffer update
+	// --------------------------------------------------------------------------
+	if (!collided) {
+		_ParticlesBuffer[id.x].pos = newPos;
+		_ParticlesBuffer[id.x].vel = newVel;
+		_ParticlesBuffer[id.x].col = float4(0.9, 0.9, 0.9, 1);
+	}
+
+	// --------------------------------------------------------------------------
+	// Outside bounds handle
+	// --------------------------------------------------------------------------
+	if (_ParticlesBuffer[id.x].pos.x < _RangeMin.x || _RangeMax.x < _ParticlesBuffer[id.x].pos.x || _ParticlesBuffer[id.x].pos.y < _RangeMin.y || _RangeMax.y < _ParticlesBuffer[id.x].pos.y) {
+		_ParticlesBuffer[id.x].pos = float2(_ParticlesBuffer[id.x].initPos.x, _RangeMax.y);
+		_ParticlesBuffer[id.x].vel = float2(0, 0);
+	}
+
+}
